@@ -468,6 +468,7 @@ var _ = Describe("fallback", func() {
 		)
 		metricSpec := createMetricSpec(10)
 		expectStatusPatch(ctrl, client)
+		mockScaleAndDeployment(ctrl, client, scaleClient, 4)
 
 		metrics, _, err := scaler.GetMetricsAndActivity(context.Background(), metricName)
 		metrics, _, err = GetMetricsWithFallback(newHandler(client, scaleClient, so), metrics, err, metricName, metricSpec)
@@ -476,6 +477,102 @@ var _ = Describe("fallback", func() {
 		value := metrics[0].Value.AsApproximateFloat64()
 		expectedValue := float64(100) // 10 replicas * 10 target value, ignoring current 15
 		Expect(value).Should(Equal(expectedValue))
+	})
+
+	It("should track consecutive failures independently per trigger and recover", func() {
+		so := buildScaledObject(
+			&kedav1alpha1.Fallback{
+				FailureThreshold: int32(2),
+				Replicas:         int32(5),
+			},
+			nil,
+		)
+		metricSpec := createMetricSpec(10)
+		triggerErr := errors.New("trigger a is unavailable")
+		expectStatusPatchAnyTimes(ctrl, client)
+		mockScaleAndDeployment(ctrl, client, scaleClient, 4)
+
+		// Two failures are exactly at the threshold and must not activate fallback.
+		for i := 0; i < 2; i++ {
+			_, fallbackActive, err := GetMetricsWithFallbackForTrigger(
+				newHandler(client, scaleClient, so), nil, triggerErr, "trigger-a", "trigger-a", metricName, metricSpec)
+			Expect(err).To(HaveOccurred())
+			Expect(fallbackActive).To(BeFalse())
+		}
+		Expect(so.Status.Health["trigger-a"]).To(haveFailureAndStatus(2, kedav1alpha1.HealthStatusFailing))
+		Expect(so.Status.Health["trigger-a"].LastError).To(Equal(triggerErr.Error()))
+		Expect(so.Status.Health["trigger-a"].LastFailureTime).ToNot(BeNil())
+
+		// A successful reading from another trigger that exposes the same metric name must not
+		// reset trigger-a's consecutive failure counter.
+		successMetric := external_metrics.ExternalMetricValue{
+			MetricName: metricName,
+			Value:      *resource.NewQuantity(10, resource.DecimalSI),
+			Timestamp:  metav1.Now(),
+		}
+		_, fallbackActive, err := GetMetricsWithFallbackForTrigger(
+			newHandler(client, scaleClient, so), []external_metrics.ExternalMetricValue{successMetric}, nil,
+			"trigger-b", "trigger-b", metricName, metricSpec)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(fallbackActive).To(BeFalse())
+		Expect(so.Status.Health["trigger-a"]).To(haveFailureAndStatus(2, kedav1alpha1.HealthStatusFailing))
+		Expect(so.Status.Health["trigger-b"]).To(haveFailureAndStatus(0, kedav1alpha1.HealthStatusHappy))
+
+		// The next consecutive failure for trigger-a exceeds the threshold and activates fallback
+		// exactly once. trigger-b stays healthy.
+		metrics, fallbackActive, err := GetMetricsWithFallbackForTrigger(
+			newHandler(client, scaleClient, so), nil, triggerErr, "trigger-a", "trigger-a", metricName, metricSpec)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(fallbackActive).To(BeTrue())
+		Expect(metrics).To(HaveLen(1))
+		Expect(metrics[0].Value.AsApproximateFloat64()).To(Equal(float64(50)))
+		Expect(so.Status.Health["trigger-a"]).To(haveFailureAndStatus(3, kedav1alpha1.HealthStatusFailing))
+		Expect(so.Status.Health["trigger-b"]).To(haveFailureAndStatus(0, kedav1alpha1.HealthStatusHappy))
+		fallbackCondition := so.Status.Conditions.GetFallbackCondition()
+		Expect(fallbackCondition.IsTrue()).To(BeTrue())
+		Expect(so.Status.Fallback).ToNot(BeNil())
+		Expect(so.Status.Fallback.Active).To(BeTrue())
+		Expect(so.Status.Fallback.Triggers).To(Equal([]string{"trigger-a"}))
+		Expect(so.Status.Fallback.CurrentReplicas).ToNot(BeNil())
+		Expect(*so.Status.Fallback.CurrentReplicas).To(Equal(int32(4)))
+
+		// Recovery clears the failing trigger's counter and the fallback condition.
+		metrics, fallbackActive, err = GetMetricsWithFallbackForTrigger(
+			newHandler(client, scaleClient, so), []external_metrics.ExternalMetricValue{successMetric}, nil,
+			"trigger-a", "trigger-a", metricName, metricSpec)
+		Expect(err).ToNot(HaveOccurred())
+		Expect(fallbackActive).To(BeFalse())
+		Expect(metrics).To(HaveLen(1))
+		Expect(so.Status.Health["trigger-a"]).To(haveFailureAndStatus(0, kedav1alpha1.HealthStatusHappy))
+		Expect(so.Status.Health["trigger-a"].LastError).To(BeEmpty())
+		Expect(so.Status.Health["trigger-a"].LastFailureTime).To(BeNil())
+		fallbackCondition = so.Status.Conditions.GetFallbackCondition()
+		Expect(fallbackCondition.IsFalse()).To(BeTrue())
+		Expect(so.Status.Fallback.Active).To(BeFalse())
+		Expect(so.Status.Fallback.Triggers).To(BeEmpty())
+	})
+
+	It("should count an empty metric result as a trigger failure", func() {
+		so := buildScaledObject(
+			&kedav1alpha1.Fallback{
+				FailureThreshold: int32(1),
+				Replicas:         int32(5),
+			},
+			nil,
+		)
+		metricSpec := createMetricSpec(10)
+		expectStatusPatchAnyTimes(ctrl, client)
+
+		metrics, fallbackActive, err := GetMetricsWithFallbackForTrigger(
+			newHandler(client, scaleClient, so), []external_metrics.ExternalMetricValue{}, nil,
+			"trigger-a", "trigger-a", metricName, metricSpec)
+
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring(`trigger "trigger-a" returned no metrics`))
+		Expect(metrics).To(BeNil())
+		Expect(fallbackActive).To(BeFalse())
+		Expect(so.Status.Health["trigger-a"]).To(haveFailureAndStatus(1, kedav1alpha1.HealthStatusFailing))
+		Expect(so.Status.Health["trigger-a"].LastError).To(ContainSubstring("returned no metrics"))
 	})
 })
 
@@ -559,6 +656,12 @@ func expectStatusPatch(ctrl *gomock.Controller, client *mock_client.MockClient) 
 	statusWriter := mock_client.NewMockStatusWriter(ctrl)
 	statusWriter.EXPECT().Patch(gomock.Any(), gomock.Any(), gomock.Any())
 	client.EXPECT().Status().Return(statusWriter)
+}
+
+func expectStatusPatchAnyTimes(ctrl *gomock.Controller, client *mock_client.MockClient) {
+	statusWriter := mock_client.NewMockStatusWriter(ctrl)
+	statusWriter.EXPECT().Patch(gomock.Any(), gomock.Any(), gomock.Any()).AnyTimes()
+	client.EXPECT().Status().Return(statusWriter).AnyTimes()
 }
 
 func expectNoStatusPatch(ctrl *gomock.Controller) {

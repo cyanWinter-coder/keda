@@ -99,7 +99,7 @@ func calculateScalingModifiersFormula(so *kedav1alpha1.ScaledObject, list []exte
 	// using https://github.com/expr-lang/expr to evaluate formula expression
 	data := make(map[string]any)
 	for _, v := range list {
-		data[pairList[v.MetricName]] = scalingModifierTriggerValue(so, v)
+		data[pairList[v.MetricName]] = scalingModifierTriggerValue(so, v, pairList[v.MetricName])
 	}
 
 	if cacheObj.CompiledFormula == nil {
@@ -143,13 +143,13 @@ func scalingModifiersFallbackTarget(so *kedav1alpha1.ScaledObject) (float64, err
 }
 
 // scalingModifierTriggerValue returns the value or nil if failure threshold is exceeded
-func scalingModifierTriggerValue(so *kedav1alpha1.ScaledObject, v external_metrics.ExternalMetricValue) any {
+func scalingModifierTriggerValue(so *kedav1alpha1.ScaledObject, v external_metrics.ExternalMetricValue, triggerName string) any {
 	val := v.Value.AsApproximateFloat64()
 	if !so.FallbackScalingModifiers() {
 		return val
 	}
 
-	hs, ok := so.Status.Health[v.MetricName]
+	hs, ok := healthStatusForTrigger(so, triggerName, v.MetricName)
 	if !ok {
 		return val
 	}
@@ -163,6 +163,30 @@ func scalingModifierTriggerValue(so *kedav1alpha1.ScaledObject, v external_metri
 	}
 
 	return nil
+}
+
+func healthStatusForTrigger(so *kedav1alpha1.ScaledObject, triggerName string, metricName string) (kedav1alpha1.HealthStatus, bool) {
+	if triggerName != "" {
+		if hs, ok := so.Status.Health[triggerName]; ok {
+			return hs, true
+		}
+	}
+
+	// Keep compatibility with health entries written by older KEDA versions, which were keyed
+	// by metric name rather than trigger name.
+	if hs, ok := so.Status.Health[metricName]; ok {
+		return hs, true
+	}
+
+	if triggerName != "" {
+		for _, hs := range so.Status.Health {
+			if hs.TriggerName == triggerName {
+				return hs, true
+			}
+		}
+	}
+
+	return kedav1alpha1.HealthStatus{}, false
 }
 
 // GetPairTriggerAndMetric adds new pair of trigger-metric to the list for

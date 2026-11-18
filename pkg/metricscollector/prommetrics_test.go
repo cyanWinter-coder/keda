@@ -127,3 +127,32 @@ func TestNewPromMetrics_DisablesHighCardinalityLabels(t *testing.T) {
 	_, err = p.httpClientRequestDuration.GetMetricWithLabelValues("default", "my-so", "prometheus", "my-trigger", "my-metric", "200")
 	assert.Error(t, err, "high-cardinality labels should not be accepted when disabled")
 }
+
+func TestPromMetrics_RecordFallback(t *testing.T) {
+	previousRegistry := ctrlmetrics.Registry
+	ctrlmetrics.Registry = prometheus.NewRegistry()
+	t.Cleanup(func() {
+		ctrlmetrics.Registry = previousRegistry
+	})
+
+	p := NewPromMetrics(false)
+	p.RecordFallback("default", "my-so", "trigger-a", true, 4)
+
+	activeMetric, err := scaledObjectFallbackActive.GetMetricWithLabelValues("default", "my-so", "trigger-a")
+	require.NoError(t, err)
+	active := &dto.Metric{}
+	require.NoError(t, activeMetric.Write(active))
+	assert.EqualValues(t, 1, active.Gauge.GetValue())
+
+	replicasMetric, err := scaledObjectFallbackCurrentReplicas.GetMetricWithLabelValues("default", "my-so", "trigger-a")
+	require.NoError(t, err)
+	replicas := &dto.Metric{}
+	require.NoError(t, replicasMetric.Write(replicas))
+	assert.EqualValues(t, 4, replicas.Gauge.GetValue())
+
+	p.RecordFallback("default", "my-so", "trigger-a", false, 0)
+	require.NoError(t, activeMetric.Write(active))
+	assert.EqualValues(t, 0, active.Gauge.GetValue())
+	require.NoError(t, replicasMetric.Write(replicas))
+	assert.EqualValues(t, 0, replicas.Gauge.GetValue())
+}

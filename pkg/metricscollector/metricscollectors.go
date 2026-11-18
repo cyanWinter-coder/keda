@@ -65,6 +65,9 @@ type MetricsCollector interface {
 	// RecordScaledObjectPaused marks whether the current ScaledObject is paused.
 	RecordScaledObjectPaused(namespace string, scaledObject string, active bool)
 
+	// RecordFallback records whether a trigger is in fallback and the current ScaleTarget replica count.
+	RecordFallback(namespace string, scaledObject string, trigger string, active bool, currentReplicas int32)
+
 	// RecordScalerError counts the number of errors occurred in trying to get an external metric used by the HPA
 	RecordScalerError(namespace string, scaledResource string, scaler string, triggerIndex int, metric string, isScaledObject bool, err error)
 
@@ -162,6 +165,13 @@ func RecordScalerActive(namespace string, scaledObject string, scaler string, tr
 func RecordScaledObjectPaused(namespace string, scaledObject string, active bool) {
 	for _, element := range collectors {
 		element.RecordScaledObjectPaused(namespace, scaledObject, active)
+	}
+}
+
+// RecordFallback records whether a trigger is in fallback and the current ScaleTarget replica count.
+func RecordFallback(namespace string, scaledObject string, trigger string, active bool, currentReplicas int32) {
+	for _, element := range collectors {
+		element.RecordFallback(namespace, scaledObject, trigger, active, currentReplicas)
 	}
 }
 

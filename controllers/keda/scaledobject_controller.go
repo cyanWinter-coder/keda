@@ -226,6 +226,14 @@ func (r *ScaledObjectReconciler) Reconcile(ctx context.Context, req ctrl.Request
 
 	if scaledObject.Spec.Fallback == nil || !fallback.HasValidFallback(scaledObject) {
 		conditions.SetFallbackCondition(metav1.ConditionFalse, "NoFallbackFound", "No fallbacks are active on this scaled object")
+		if scaledObject.Status.Fallback != nil {
+			status := scaledObject.Status.DeepCopy()
+			status.Fallback = nil
+			if err := kedastatus.UpdateScaledObjectStatus(ctx, r.Client, reqLogger, scaledObject, status); err != nil {
+				r.EventEmitter.Emit(scaledObject, req.Namespace, corev1.EventTypeWarning, eventingv1alpha1.ScaledObjectFailedType, eventreason.ScaledObjectUpdateFailed, err.Error())
+				return ctrl.Result{}, err
+			}
+		}
 	}
 
 	metricscollector.RecordScaledObjectPaused(scaledObject.Namespace, scaledObject.Name, conditions.GetPausedCondition().Status == metav1.ConditionTrue)

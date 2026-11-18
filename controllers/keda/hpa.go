@@ -396,10 +396,31 @@ func (r *ScaledObjectReconciler) getScaledObjectMetricSpecs(ctx context.Context,
 func updateHealthStatus(scaledObject *kedav1alpha1.ScaledObject, externalMetricNames []string, status *kedav1alpha1.ScaledObjectStatus) {
 	health := scaledObject.Status.Health
 	newHealth := make(map[string]kedav1alpha1.HealthStatus)
+	triggerNames := make(map[string]struct{}, len(scaledObject.Spec.Triggers))
+	for _, trigger := range scaledObject.Spec.Triggers {
+		if trigger.Name != "" {
+			triggerNames[trigger.Name] = struct{}{}
+		}
+	}
 	for _, metricName := range externalMetricNames {
 		entry, exists := health[metricName]
 		if exists {
 			newHealth[metricName] = entry
+		}
+	}
+	// Health is maintained per trigger. Keep those entries even though the HPA only knows the
+	// generated external metric names; otherwise a reconcile would drop the consecutive failure
+	// counters and cause fallback to restart from zero.
+	for healthKey, entry := range health {
+		if _, exists := newHealth[healthKey]; exists {
+			continue
+		}
+		if _, exists := triggerNames[healthKey]; exists {
+			newHealth[healthKey] = entry
+			continue
+		}
+		if entry.TriggerName != "" {
+			newHealth[healthKey] = entry
 		}
 	}
 	status.Health = newHealth

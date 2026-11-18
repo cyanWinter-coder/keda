@@ -55,8 +55,10 @@ var (
 	otCloudEventEmittedCounter  api.Int64Counter
 	otCloudEventQueueStatusVals []OtelMetricFloat64Val
 
-	otelScalerActiveVals []OtelMetricFloat64Val
-	otelScalerPauseVals  []OtelMetricFloat64Val
+	otelScalerActiveVals            []OtelMetricFloat64Val
+	otelScalerPauseVals             []OtelMetricFloat64Val
+	otelFallbackActiveVals          []OtelMetricFloat64Val
+	otelFallbackCurrentReplicasVals []OtelMetricFloat64Val
 
 	otHTTPClientRequestsCounter api.Int64Counter
 	otHTTPClientRequestDuration api.Float64Histogram
@@ -246,6 +248,24 @@ func initMeters() {
 		"keda.scaled.object.paused",
 		api.WithDescription("Indicates whether a ScaledObject is paused"),
 		api.WithFloat64Callback(PausedStatusCallback),
+	)
+	if err != nil {
+		otLog.Error(err, msg)
+	}
+
+	_, err = meter.Float64ObservableGauge(
+		"keda.scaled.object.fallback.active",
+		api.WithDescription("Indicates whether a trigger is using fallback"),
+		api.WithFloat64Callback(FallbackActiveCallback),
+	)
+	if err != nil {
+		otLog.Error(err, msg)
+	}
+
+	_, err = meter.Float64ObservableGauge(
+		"keda.scaled.object.fallback.current_replicas",
+		api.WithDescription("The ScaleTarget replica count observed while a trigger is using fallback"),
+		api.WithFloat64Callback(FallbackCurrentReplicasCallback),
 	)
 	if err != nil {
 		otLog.Error(err, msg)
@@ -473,6 +493,54 @@ func (o *OtelMetrics) RecordScaledObjectPaused(namespace string, scaledObject st
 	otelScalerPause.val = float64(activeVal)
 	otelScalerPause.measurementOption = opt
 	otelScalerPauseVals = append(otelScalerPauseVals, otelScalerPause)
+}
+
+// FallbackActiveCallback reports the buffered keda.scaled.object.fallback.active measurements and clears the buffer.
+func FallbackActiveCallback(_ context.Context, obsrv api.Float64Observer) error {
+	otelValsMu.Lock()
+	defer otelValsMu.Unlock()
+	for _, v := range otelFallbackActiveVals {
+		obsrv.Observe(v.val, v.measurementOption)
+	}
+	otelFallbackActiveVals = []OtelMetricFloat64Val{}
+	return nil
+}
+
+// FallbackCurrentReplicasCallback reports the buffered keda.scaled.object.fallback.current_replicas
+// measurements and clears the buffer.
+func FallbackCurrentReplicasCallback(_ context.Context, obsrv api.Float64Observer) error {
+	otelValsMu.Lock()
+	defer otelValsMu.Unlock()
+	for _, v := range otelFallbackCurrentReplicasVals {
+		obsrv.Observe(v.val, v.measurementOption)
+	}
+	otelFallbackCurrentReplicasVals = []OtelMetricFloat64Val{}
+	return nil
+}
+
+// RecordFallback records whether a trigger is using fallback and the current ScaleTarget replica count.
+func (o *OtelMetrics) RecordFallback(namespace string, scaledObject string, trigger string, active bool, currentReplicas int32) {
+	otelValsMu.Lock()
+	defer otelValsMu.Unlock()
+
+	activeVal := 0
+	if active {
+		activeVal = 1
+	}
+
+	opt := api.WithAttributes(
+		attribute.Key("namespace").String(namespace),
+		attribute.Key("scaledObject").String(scaledObject),
+		attribute.Key("trigger").String(trigger))
+
+	otelFallbackActiveVals = append(otelFallbackActiveVals, OtelMetricFloat64Val{
+		val:               float64(activeVal),
+		measurementOption: opt,
+	})
+	otelFallbackCurrentReplicasVals = append(otelFallbackCurrentReplicasVals, OtelMetricFloat64Val{
+		val:               float64(currentReplicas),
+		measurementOption: opt,
+	})
 }
 
 // RecordScalerError counts the number of errors occurred in trying to get an external metric used by the HPA

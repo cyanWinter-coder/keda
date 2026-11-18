@@ -411,16 +411,54 @@ spec:
                 items:
                   type: string
                 type: array
+              fallback:
+                description: FallbackStatus describes the currently active fallback
+                  for a ScaledObject.
+                properties:
+                  active:
+                    description: Active indicates whether at least one trigger is
+                      currently falling back.
+                    type: boolean
+                  currentReplicas:
+                    description: CurrentReplicas is the ScaleTarget replica count
+                      observed while fallback was active.
+                    format: int32
+                    type: integer
+                  reason:
+                    description: Reason is the most recent trigger error that caused
+                      the fallback.
+                    type: string
+                  triggers:
+                    description: Triggers contains the names of the triggers that
+                      exceeded the failure threshold.
+                    items:
+                      type: string
+                    type: array
+                type: object
               health:
                 additionalProperties:
                   description: HealthStatus is the status for a ScaledObject's health
                   properties:
+                    lastError:
+                      description: LastError is the most recent error reported by
+                        the trigger.
+                      type: string
+                    lastFailureTime:
+                      description: LastFailureTime is the time when the failure counter
+                        was last incremented.
+                      format: date-time
+                      type: string
                     numberOfFailures:
                       format: int32
                       type: integer
                     status:
                       description: HealthStatusType is an indication of whether the
                         health status is happy or failing
+                      type: string
+                    triggerName:
+                      description: |-
+                        TriggerName is the name of the trigger this health status belongs to.
+                        It is populated when the health entry is keyed by a generated trigger key.
                       type: string
                   type: object
                 type: object

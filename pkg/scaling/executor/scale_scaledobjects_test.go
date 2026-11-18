@@ -1355,3 +1355,69 @@ func TestRequestScale_ScalerErrorWithFallback_HPAHealthy(t *testing.T) {
 	readyCond := result.Conditions.GetReadyCondition()
 	assert.Truef(t, readyCond.IsTrue(), "with fallback configured and HPA healthy, Ready should be True, got %s/%s", readyCond.Status, readyCond.Reason)
 }
+
+func TestRequestScale_TriggerErrorWithoutActiveTrigger_DoesNotScaleDown(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	mockClient := mock_client.NewMockClient(ctrl)
+	recorder := events.NewFakeRecorder(1)
+	mockScaleClient := mock_scale.NewMockScalesGetter(ctrl)
+	exec := NewScaleExecutor(mockClient, mockScaleClient, nil, kubernetesAPITimeout, recorder)
+
+	so := newSOWithHPA()
+	minReplicas := int32(0)
+	so.Spec.MinReplicaCount = &minReplicas
+	so.Spec.Fallback = &v1alpha1.Fallback{FailureThreshold: 3, Replicas: 0}
+	so.Status.Conditions = *v1alpha1.GetInitializedConditions()
+
+	replicas := int32(2)
+	mockClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.AssignableToTypeOf(&appsv1.Deployment{})).
+		DoAndReturn(func(_ context.Context, _ types.NamespacedName, obj *appsv1.Deployment, _ ...any) error {
+			obj.Spec.Replicas = &replicas
+			return nil
+		})
+	mockHealthyHPA(mockClient)
+
+	// A trigger error while no trigger is active must hold the current replica count. It must
+	// not use the normal inactive path, which would deactivate the target.
+	result := exec.RequestScale(context.TODO(), &so, false, true, ScaleExecutorOptions{})
+
+	assert.NoError(t, result.Error)
+	assert.Empty(t, recorder.Events)
+}
+
+func TestRequestScale_ActiveTriggerAtZero_ScalesUpInsteadOfDown(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	mockClient := mock_client.NewMockClient(ctrl)
+	recorder := events.NewFakeRecorder(10)
+	mockScaleClient := mock_scale.NewMockScalesGetter(ctrl)
+	mockScaleInterface := mock_scale.NewMockScaleInterface(ctrl)
+	exec := NewScaleExecutor(mockClient, mockScaleClient, nil, kubernetesAPITimeout, recorder)
+
+	so := newSOWithHPA()
+	minReplicas := int32(0)
+	so.Spec.MinReplicaCount = &minReplicas
+	so.Spec.Fallback = &v1alpha1.Fallback{FailureThreshold: 3, Replicas: 2}
+	so.Status.Conditions = *v1alpha1.GetInitializedConditions()
+
+	replicas := int32(0)
+	mockClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.AssignableToTypeOf(&appsv1.Deployment{})).
+		DoAndReturn(func(_ context.Context, _ types.NamespacedName, obj *appsv1.Deployment, _ ...any) error {
+			obj.Spec.Replicas = &replicas
+			return nil
+		})
+	mockHealthyHPA(mockClient)
+
+	scale := &autoscalingv1.Scale{Spec: autoscalingv1.ScaleSpec{Replicas: replicas}}
+	mockScaleClient.EXPECT().Scales("test-ns").Return(mockScaleInterface).Times(2)
+	mockScaleInterface.EXPECT().Get(gomock.Any(), gomock.Any(), "test-deploy", gomock.Any()).Return(scale, nil)
+	mockScaleInterface.EXPECT().Update(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(scale, nil)
+
+	// One trigger remains active and another is failing. The active trigger must force scaling
+	// up from zero; the failure must not be interpreted as "all triggers inactive".
+	result := exec.RequestScale(context.TODO(), &so, true, true, ScaleExecutorOptions{})
+
+	assert.NoError(t, result.Error)
+	assert.Equal(t, int32(1), scale.Spec.Replicas)
+	activeCondition := result.Conditions.GetActiveCondition()
+	assert.True(t, activeCondition.IsTrue())
+}

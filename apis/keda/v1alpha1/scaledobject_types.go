@@ -73,6 +73,32 @@ type HealthStatus struct {
 	NumberOfFailures *int32 `json:"numberOfFailures,omitempty"`
 	// +optional
 	Status HealthStatusType `json:"status,omitempty"`
+	// TriggerName is the name of the trigger this health status belongs to.
+	// It is populated when the health entry is keyed by a generated trigger key.
+	// +optional
+	TriggerName string `json:"triggerName,omitempty"`
+	// LastError is the most recent error reported by the trigger.
+	// +optional
+	LastError string `json:"lastError,omitempty"`
+	// LastFailureTime is the time when the failure counter was last incremented.
+	// +optional
+	LastFailureTime *metav1.Time `json:"lastFailureTime,omitempty"`
+}
+
+// FallbackStatus describes the currently active fallback for a ScaledObject.
+type FallbackStatus struct {
+	// Active indicates whether at least one trigger is currently falling back.
+	// +optional
+	Active bool `json:"active"`
+	// Triggers contains the names of the triggers that exceeded the failure threshold.
+	// +optional
+	Triggers []string `json:"triggers,omitempty"`
+	// CurrentReplicas is the ScaleTarget replica count observed while fallback was active.
+	// +optional
+	CurrentReplicas *int32 `json:"currentReplicas,omitempty"`
+	// Reason is the most recent trigger error that caused the fallback.
+	// +optional
+	Reason string `json:"reason,omitempty"`
 }
 
 // TriggerActivityStatus represents the activity status of an external trigger
@@ -205,6 +231,8 @@ type ScaledObjectStatus struct {
 	Conditions Conditions `json:"conditions,omitempty"`
 	// +optional
 	Health map[string]HealthStatus `json:"health,omitempty"`
+	// +optional
+	Fallback *FallbackStatus `json:"fallback,omitempty"`
 	// +optional
 	TriggersActivity map[string]TriggerActivityStatus `json:"triggersActivity,omitempty"`
 	// +optional

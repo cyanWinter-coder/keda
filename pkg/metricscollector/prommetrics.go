@@ -78,6 +78,24 @@ var (
 		},
 		[]string{"namespace", "scaledObject"},
 	)
+	scaledObjectFallbackActive = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: DefaultPromMetricsNamespace,
+			Subsystem: "scaled_object",
+			Name:      "fallback_active",
+			Help:      "Indicates whether a trigger is using fallback (1), or not (0).",
+		},
+		[]string{"namespace", "scaledObject", "trigger"},
+	)
+	scaledObjectFallbackCurrentReplicas = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: DefaultPromMetricsNamespace,
+			Subsystem: "scaled_object",
+			Name:      "fallback_current_replicas",
+			Help:      "The ScaleTarget replica count observed while a trigger is using fallback.",
+		},
+		[]string{"namespace", "scaledObject", "trigger"},
+	)
 	scalerErrors = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Namespace: DefaultPromMetricsNamespace,
@@ -190,6 +208,8 @@ func NewPromMetrics(enableHighCardinalityLabels bool) *PromMetrics {
 	metrics.Registry.MustRegister(scalerErrors)
 	metrics.Registry.MustRegister(scaledObjectErrors)
 	metrics.Registry.MustRegister(scaledObjectPaused)
+	metrics.Registry.MustRegister(scaledObjectFallbackActive)
+	metrics.Registry.MustRegister(scaledObjectFallbackCurrentReplicas)
 	metrics.Registry.MustRegister(triggerRegistered)
 	metrics.Registry.MustRegister(crdRegistered)
 	metrics.Registry.MustRegister(scaledJobErrors)
@@ -275,6 +295,8 @@ func (p *PromMetrics) DeleteScalerMetrics(namespace string, scaledResource strin
 	scalerActive.DeletePartialMatch(prometheus.Labels{"namespace": namespace, "scaledObject": scaledResource, "type": getResourceType(isScaledObject)})
 	scalerErrors.DeletePartialMatch(prometheus.Labels{"namespace": namespace, "scaledObject": scaledResource, "type": getResourceType(isScaledObject)})
 	scalerMetricsLatency.DeletePartialMatch(prometheus.Labels{"namespace": namespace, "scaledObject": scaledResource, "type": getResourceType(isScaledObject)})
+	scaledObjectFallbackActive.DeletePartialMatch(prometheus.Labels{"namespace": namespace, "scaledObject": scaledResource})
+	scaledObjectFallbackCurrentReplicas.DeletePartialMatch(prometheus.Labels{"namespace": namespace, "scaledObject": scaledResource})
 }
 
 // RecordScalerLatency create a measurement of the latency to external metric
@@ -307,6 +329,19 @@ func (p *PromMetrics) RecordScaledObjectPaused(namespace string, scaledObject st
 	}
 
 	scaledObjectPaused.With(labels).Set(float64(activeVal))
+}
+
+// RecordFallback records whether a trigger is using fallback and the current ScaleTarget replica count.
+func (p *PromMetrics) RecordFallback(namespace string, scaledObject string, trigger string, active bool, currentReplicas int32) {
+	labels := prometheus.Labels{"namespace": namespace, "scaledObject": scaledObject, "trigger": trigger}
+
+	activeVal := 0
+	if active {
+		activeVal = 1
+	}
+
+	scaledObjectFallbackActive.With(labels).Set(float64(activeVal))
+	scaledObjectFallbackCurrentReplicas.With(labels).Set(float64(currentReplicas))
 }
 
 // RecordScalerError counts the number of errors occurred in trying to get an external metric used by the HPA

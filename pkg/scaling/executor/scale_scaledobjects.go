@@ -90,18 +90,21 @@ func (e *scaleExecutor) RequestScale(ctx context.Context, scaledObject *kedav1al
 		// isActive == false
 		result.Conditions.SetActiveCondition(metav1.ConditionFalse, "ScalerNotActive", "Scaling is not performed because triggers are not active")
 		switch {
-		case isError && scaledObject.Spec.Fallback != nil && scaledObject.Spec.Fallback.Replicas != 0:
-			// We need to have this switch case even if just for logging.
-			// Otherwise, if we have `minReplicas=zero`, we will fall into the third case expression,
-			// which will scale the target to 0. Scaling the target to 0 means the HPA will not scale it to fallback.replicas
-			// after fallback.failureThreshold has passed because of what's described here:
-			// https://kubernetes.io/docs/tasks/run-application/horizontal-pod-autoscale/#implicit-maintenance-mode-deactivation
-			logger.V(1).Info("ScaleTarget will fallback to Fallback.Replicas after Fallback.FailureThreshold")
-		case isError && scaledObject.Spec.Fallback == nil:
-			// there are no active triggers, but a scaler responded with an error AND there is not a fallback replicas count defined
-			msg := "Triggers defined in ScaledObject are not working correctly"
-			result.Conditions.SetReadyCondition(metav1.ConditionFalse, "TriggerError", msg)
-			logger.V(1).Info(msg)
+		case isError:
+			// No trigger is currently active, but at least one trigger failed. Never treat this as
+			// a normal scale-to-zero path: the scaler state is unknown, so keep the current replica
+			// count and wait for either the failure threshold to engage fallback or the trigger to
+			// recover. Scaling to zero here would also disable the HPA and prevent a fallback from
+			// taking effect (see the implicit maintenance mode note in the HPA documentation).
+			if scaledObject.Spec.Fallback != nil {
+				logger.V(1).Info("Trigger error observed below fallback threshold or fallback unavailable; keeping current replicas",
+					"fallback.replicas", scaledObject.Spec.Fallback.Replicas,
+					"fallback.failureThreshold", scaledObject.Spec.Fallback.FailureThreshold)
+			} else {
+				msg := "Triggers defined in ScaledObject are not working correctly"
+				result.Conditions.SetReadyCondition(metav1.ConditionFalse, "TriggerError", msg)
+				logger.V(1).Info(msg)
+			}
 		case scaledObject.Spec.IdleReplicaCount != nil && currentReplicas > *scaledObject.Spec.IdleReplicaCount, currentReplicas > 0 && minReplicas == 0:
 			// there are no active triggers, Idle Replicas mode is enabled AND current replicas count is greater than Idle Replicas count
 			// Try to scale the deployment down, HPA will handle other scale in operations

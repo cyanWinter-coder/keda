@@ -490,9 +490,9 @@ func (h *scaleHandler) checkScalers(ctx context.Context, scalableObject kedav1al
 		}
 
 		if isFallbackActive && fallbackStatus != metav1.ConditionTrue {
-			h.recorder.Eventf(obj, nil, corev1.EventTypeNormal, eventreason.ScaledObjectFallbackActivated, eventreason.ScaledObjectFallbackActivated, "%s", message.ScaledObjectFallbackActivatedMsg)
+			h.recorder.Eventf(obj, nil, corev1.EventTypeNormal, eventreason.ScaledObjectFallbackActivated, eventreason.ScaledObjectFallbackActivated, "%s", fallbackActivatedMessage(obj))
 		} else if !isFallbackActive && fallbackStatus == metav1.ConditionTrue {
-			h.recorder.Eventf(obj, nil, corev1.EventTypeNormal, eventreason.ScaledObjectFallbackDeactivated, eventreason.ScaledObjectFallbackDeactivated, "%s", message.ScaledObjectFallbackDeactivatedMsg)
+			h.recorder.Eventf(obj, nil, corev1.EventTypeNormal, eventreason.ScaledObjectFallbackDeactivated, eventreason.ScaledObjectFallbackDeactivated, "%s", fallbackDeactivatedMessage(obj))
 		}
 
 		result := h.scaleExecutor.RequestScale(ctx, obj, isActive, isError, executor.ScaleExecutorOptions{ActiveTriggers: activeTriggers})
@@ -514,6 +514,30 @@ func (h *scaleHandler) checkScalers(ctx context.Context, scalableObject kedav1al
 		result := h.scaleExecutor.RequestJobScale(ctx, obj, isActive, isError, scaleTo, maxScale, executor.ScaleExecutorOptions{ActiveTriggers: activeTriggers})
 		h.handleResult(ctx, obj, result)
 	}
+}
+
+func fallbackActivatedMessage(scaledObject *kedav1alpha1.ScaledObject) string {
+	fallbackStatus := scaledObject.Status.Fallback
+	if fallbackStatus == nil || len(fallbackStatus.Triggers) == 0 {
+		return message.ScaledObjectFallbackActivatedMsg
+	}
+
+	msg := fmt.Sprintf("%s for trigger(s): %s", message.ScaledObjectFallbackActivatedMsg, strings.Join(fallbackStatus.Triggers, ", "))
+	if fallbackStatus.CurrentReplicas != nil {
+		msg = fmt.Sprintf("%s; current replicas: %d", msg, *fallbackStatus.CurrentReplicas)
+	}
+	if fallbackStatus.Reason != "" {
+		msg = fmt.Sprintf("%s; reason: %s", msg, fallbackStatus.Reason)
+	}
+	return msg
+}
+
+func fallbackDeactivatedMessage(scaledObject *kedav1alpha1.ScaledObject) string {
+	msg := message.ScaledObjectFallbackDeactivatedMsg
+	if fallbackStatus := scaledObject.Status.Fallback; fallbackStatus != nil && fallbackStatus.CurrentReplicas != nil {
+		msg = fmt.Sprintf("%s; current replicas: %d", msg, *fallbackStatus.CurrentReplicas)
+	}
+	return msg
 }
 
 /// --------------------------------------------------------------------------- ///
@@ -670,9 +694,9 @@ func (h *scaleHandler) ClearScalersCache(ctx context.Context, scalableObject ked
 /// --------------------------------------------------------------------------- ///
 
 // processMetricsWithFallback processes metrics with fallback support and handles metric recording
-func (h *scaleHandler) processMetricsWithFallback(soh fallback.ScaledObjectHandler, rawMetrics []external_metrics.ExternalMetricValue, rawErr error, metricName string, triggerName string, triggerIndex int, metricSpec v2.MetricSpec, sendRawMetricsCondition bool, isMetricActive bool, logger logr.Logger) ([]external_metrics.ExternalMetricValue, bool, error) {
+func (h *scaleHandler) processMetricsWithFallback(soh fallback.ScaledObjectHandler, rawMetrics []external_metrics.ExternalMetricValue, rawErr error, metricName string, triggerName string, healthKey string, triggerIndex int, metricSpec v2.MetricSpec, sendRawMetricsCondition bool, isMetricActive bool, logger logr.Logger) ([]external_metrics.ExternalMetricValue, bool, error) {
 	// check if we need to set a fallback
-	metrics, fallbackActive, err := fallback.GetMetricsWithFallback(soh, rawMetrics, rawErr, metricName, metricSpec)
+	metrics, fallbackActive, err := fallback.GetMetricsWithFallbackForTrigger(soh, rawMetrics, rawErr, triggerName, healthKey, metricName, metricSpec)
 	so := soh.ScaledObject
 
 	if err != nil {
@@ -701,7 +725,7 @@ func (h *scaleHandler) processMetricsWithFallback(soh fallback.ScaledObjectHandl
 // streamed to. The returned error is non-nil only when the scalers cache was replaced mid-read
 // (cache.ErrCacheClosed); the caller should discard the observation, the next iteration uses
 // the fresh cache.
-func (h *scaleHandler) observeMetric(ctx context.Context, logger logr.Logger, scaledObject *kedav1alpha1.ScaledObject, scalersCache *cache.ScalersCache, triggerIndex int, triggerName string, spec v2.MetricSpec, cachedRaw *metricscache.MetricsRecord, rawMetricsMode RawMetricsMode) (metricscache.MetricsRecord, error) {
+func (h *scaleHandler) observeMetric(ctx context.Context, logger logr.Logger, scaledObject *kedav1alpha1.ScaledObject, scalersCache *cache.ScalersCache, triggerIndex int, triggerName string, healthKey string, spec v2.MetricSpec, cachedRaw *metricscache.MetricsRecord, rawMetricsMode RawMetricsMode) (metricscache.MetricsRecord, error) {
 	metricName := spec.External.Metric.Name
 
 	var rawMetrics []external_metrics.ExternalMetricValue
@@ -731,7 +755,7 @@ func (h *scaleHandler) observeMetric(ctx context.Context, logger logr.Logger, sc
 		UpdateLock:   &scalersCache.ScaledObjectUpdateLock,
 		ScaledObject: scaledObject,
 	}
-	metrics, fallbackActive, err := h.processMetricsWithFallback(soh, rawMetrics, rawErr, metricName, triggerName, triggerIndex, spec, shouldSendRawMetrics(rawMetricsMode), isMetricActive, logger)
+	metrics, fallbackActive, err := h.processMetricsWithFallback(soh, rawMetrics, rawErr, metricName, triggerName, healthKey, triggerIndex, spec, shouldSendRawMetrics(rawMetricsMode), isMetricActive, logger)
 	return metricscache.MetricsRecord{
 		Metric:         metrics,
 		IsMetricActive: isMetricActive,
@@ -747,6 +771,16 @@ func triggerNameForScaler(scaler scalers.Scaler, scalerConfig scalersconfig.Scal
 		return scalerConfig.TriggerName
 	}
 	return strings.Replace(fmt.Sprintf("%T", scaler), "*scalers.", "", 1)
+}
+
+// triggerHealthKey returns the key used for a trigger's consecutive failure counter. Explicit
+// trigger names are stable and unique (the admission webhook rejects duplicates). For unnamed
+// triggers the scaler type alone is not unique, so the trigger index is appended.
+func triggerHealthKey(configuredName string, triggerIndex int, triggerName string) string {
+	if configuredName != "" {
+		return configuredName
+	}
+	return fmt.Sprintf("%s#%d", triggerName, triggerIndex)
 }
 
 // GetScaledObjectMetrics returns metrics for specified metric name for a ScaledObject identified by its name and namespace.
@@ -856,7 +890,8 @@ func (h *scaleHandler) GetScaledObjectMetrics(ctx context.Context, scaledObjectN
 						}
 					}
 
-					record, err := h.observeMetric(ctx, logger, scaledObject, scalersCache, triggerIndex, triggerName, spec, cachedRaw, RawMetricsHPA)
+					healthKey := triggerHealthKey(scalerConfig.TriggerName, triggerIndex, triggerName)
+					record, err := h.observeMetric(ctx, logger, scaledObject, scalersCache, triggerIndex, triggerName, healthKey, spec, cachedRaw, RawMetricsHPA)
 					if err != nil {
 						// scalers cache was replaced mid-read, discard the observation
 						results <- result
@@ -1166,7 +1201,8 @@ func (h *scaleHandler) getScalerState(ctx context.Context, scaler scalers.Scaler
 			}
 		} else {
 			var errCacheClosed error
-			record, errCacheClosed = h.observeMetric(ctx, logger, scaledObject, scalersCache, triggerIndex, result.TriggerName, spec, nil, RawMetricsPollingInterval)
+			healthKey := triggerHealthKey(scalerConfig.TriggerName, triggerIndex, result.TriggerName)
+			record, errCacheClosed = h.observeMetric(ctx, logger, scaledObject, scalersCache, triggerIndex, result.TriggerName, healthKey, spec, nil, RawMetricsPollingInterval)
 			if errCacheClosed != nil {
 				continue
 			}
