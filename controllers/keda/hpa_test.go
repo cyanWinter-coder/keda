@@ -24,7 +24,11 @@ import (
 	. "github.com/onsi/gomega"
 	"go.uber.org/mock/gomock"
 	v2 "k8s.io/api/autoscaling/v2"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 
 	"github.com/kedacore/keda/v2/apis/keda/v1alpha1"
 	"github.com/kedacore/keda/v2/pkg/mock/mock_client"
@@ -214,3 +218,143 @@ func setupTest(health map[string]v1alpha1.HealthStatus, scaler *mock_scalers.Moc
 
 	return scaledObject
 }
+
+var _ = Describe("updateHPAWithConflictRetry", func() {
+	var (
+		reconciler ScaledObjectReconciler
+		client     *mock_client.MockClient
+		logger     logr.Logger
+		ctrl       *gomock.Controller
+	)
+
+	BeforeEach(func() {
+		ctrl = gomock.NewController(GinkgoT())
+		client = mock_client.NewMockClient(ctrl)
+		logger = logr.Discard()
+		reconciler = ScaledObjectReconciler{Client: client}
+	})
+
+	AfterEach(func() {
+		ctrl.Finish()
+	})
+
+	namespacedName := types.NamespacedName{Name: "keda-hpa-test", Namespace: "test-ns"}
+	conflict := func() error {
+		return apierrors.NewConflict(schema.GroupResource{Group: "autoscaling", Resource: "horizontalpodautoscalers"}, "keda-hpa-test",
+			context.DeadlineExceeded)
+	}
+
+	It("retries against a fresh object when the first update conflicts", func() {
+		// first read -> update conflicts; second read -> update succeeds
+		client.EXPECT().Get(gomock.Any(), namespacedName, gomock.Any()).
+			DoAndReturn(func(_ context.Context, _ types.NamespacedName, hpa *v2.HorizontalPodAutoscaler, _ ...any) error {
+				hpa.ObjectMeta = v1.ObjectMeta{Name: "keda-hpa-test", Namespace: "test-ns", ResourceVersion: "100"}
+				hpa.Labels = map[string]string{"stale": "true"}
+				return nil
+			})
+		client.EXPECT().Update(gomock.Any(), gomock.Any(), gomock.Any()).Return(conflict())
+		client.EXPECT().Get(gomock.Any(), namespacedName, gomock.Any()).
+			DoAndReturn(func(_ context.Context, _ types.NamespacedName, hpa *v2.HorizontalPodAutoscaler, _ ...any) error {
+				hpa.ObjectMeta = v1.ObjectMeta{Name: "keda-hpa-test", Namespace: "test-ns", ResourceVersion: "101"}
+				hpa.Labels = map[string]string{"concurrent": "write"}
+				return nil
+			})
+		client.EXPECT().Update(gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, hpa *v2.HorizontalPodAutoscaler, _ ...any) error {
+				// the retried write is based on the fresh resourceVersion and carries the desired labels
+				Expect(hpa.ResourceVersion).To(Equal("101"))
+				Expect(hpa.Labels).To(Equal(map[string]string{"desired": "label"}))
+				return nil
+			})
+
+		err := reconciler.updateHPAWithConflictRetry(context.Background(), logger, namespacedName,
+			func(hpa *v2.HorizontalPodAutoscaler) {
+				hpa.Labels = map[string]string{"desired": "label"}
+			})
+
+		Expect(err).ToNot(HaveOccurred())
+	})
+
+	It("returns a non-conflict error without retrying", func() {
+		client.EXPECT().Get(gomock.Any(), namespacedName, gomock.Any()).
+			DoAndReturn(func(_ context.Context, _ types.NamespacedName, hpa *v2.HorizontalPodAutoscaler, _ ...any) error {
+				hpa.ObjectMeta = v1.ObjectMeta{Name: "keda-hpa-test", Namespace: "test-ns", ResourceVersion: "100"}
+				return nil
+			})
+		internalErr := apierrors.NewInternalError(context.DeadlineExceeded)
+		client.EXPECT().Update(gomock.Any(), gomock.Any(), gomock.Any()).Return(internalErr)
+
+		err := reconciler.updateHPAWithConflictRetry(context.Background(), logger, namespacedName,
+			func(hpa *v2.HorizontalPodAutoscaler) {
+				hpa.Labels = map[string]string{"desired": "label"}
+			})
+
+		Expect(apierrors.IsInternalError(err)).To(BeTrue())
+		Expect(apierrors.IsConflict(err)).To(BeFalse())
+	})
+
+	It("surfaces a read error without attempting an update", func() {
+		notFound := apierrors.NewNotFound(schema.GroupResource{Group: "autoscaling", Resource: "horizontalpodautoscalers"}, "keda-hpa-test")
+		client.EXPECT().Get(gomock.Any(), namespacedName, gomock.Any()).Return(notFound)
+
+		called := false
+		err := reconciler.updateHPAWithConflictRetry(context.Background(), logger, namespacedName,
+			func(hpa *v2.HorizontalPodAutoscaler) {
+				called = true
+			})
+
+		Expect(apierrors.IsNotFound(err)).To(BeTrue())
+		Expect(called).To(BeFalse(), "the apply function must not run when the HPA cannot be read")
+	})
+
+	It("re-applies owner references after a conflict so ownership transfer is not lost", func() {
+		desiredOwnerRefs := []v1.OwnerReference{{
+			APIVersion: "keda.sh/v1alpha1",
+			Kind:       "ScaledObject",
+			Name:       "owning-so",
+			UID:        "abc-123",
+			Controller: ptr.To(true),
+		}}
+
+		// the existing HPA is owned by a foreign controller; the retried read returns a fresh copy
+		// that still carries that foreign owner, and the apply must replace it with the desired refs
+		foreignOwnerRefs := []v1.OwnerReference{{
+			APIVersion: "apps/v1",
+			Kind:       "Deployment",
+			Name:       "foreign-owner",
+			UID:        "foreign-uid",
+		}}
+
+		client.EXPECT().Get(gomock.Any(), namespacedName, gomock.Any()).
+			DoAndReturn(func(_ context.Context, _ types.NamespacedName, hpa *v2.HorizontalPodAutoscaler, _ ...any) error {
+				hpa.ObjectMeta = v1.ObjectMeta{
+					Name: "keda-hpa-test", Namespace: "test-ns", ResourceVersion: "100",
+					OwnerReferences: foreignOwnerRefs,
+				}
+				return nil
+			})
+		client.EXPECT().Update(gomock.Any(), gomock.Any(), gomock.Any()).Return(conflict())
+		client.EXPECT().Get(gomock.Any(), namespacedName, gomock.Any()).
+			DoAndReturn(func(_ context.Context, _ types.NamespacedName, hpa *v2.HorizontalPodAutoscaler, _ ...any) error {
+				hpa.ObjectMeta = v1.ObjectMeta{
+					Name: "keda-hpa-test", Namespace: "test-ns", ResourceVersion: "101",
+					OwnerReferences: foreignOwnerRefs,
+				}
+				return nil
+			})
+		client.EXPECT().Update(gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, hpa *v2.HorizontalPodAutoscaler, _ ...any) error {
+				Expect(hpa.ResourceVersion).To(Equal("101"))
+				Expect(hpa.OwnerReferences).To(Equal(desiredOwnerRefs),
+					"the retried write must carry the ScaledObject owner reference rather than the foreign owner")
+				return nil
+			})
+
+		err := reconciler.updateHPAWithConflictRetry(context.Background(), logger, namespacedName,
+			func(hpa *v2.HorizontalPodAutoscaler) {
+				hpa.OwnerReferences = desiredOwnerRefs
+			})
+
+		Expect(err).ToNot(HaveOccurred())
+	})
+})

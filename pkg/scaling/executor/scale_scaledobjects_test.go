@@ -19,6 +19,7 @@ package executor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -28,8 +29,11 @@ import (
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/tools/events"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -106,6 +110,9 @@ func TestUpdateScaleOnScaleTarget_KubernetesAPITimeout(t *testing.T) {
 
 	const timeout = 20 * time.Millisecond
 	exec := NewScaleExecutor(client, mockScaleClient, nil, timeout, recorder).(*scaleExecutor)
+	// a single attempt is enough: the Get fails with a non-conflict error, so nothing is retried
+	restoreBackoff := useScaleUpdateBackoff(t, 2)
+	defer restoreBackoff()
 	pollingInterval := int32(0)
 	scaledObject := &v1alpha1.ScaledObject{
 		ObjectMeta: v1.ObjectMeta{Name: "name", Namespace: "namespace"},
@@ -141,6 +148,10 @@ func TestUpdateScaleOnScaleTarget_KubernetesAPITimeoutDuringUpdate(t *testing.T)
 
 	const timeout = 20 * time.Millisecond
 	exec := NewScaleExecutor(client, mockScaleClient, nil, timeout, recorder).(*scaleExecutor)
+	// the deadline-exceeded error from Update is not a conflict, but pin the backoff anyway to keep
+	// the test fast and the mock expectations exactly one Get/Update pair
+	restoreBackoff := useScaleUpdateBackoff(t, 2)
+	defer restoreBackoff()
 	pollingInterval := int32(0)
 	scaledObject := &v1alpha1.ScaledObject{
 		ObjectMeta: v1.ObjectMeta{Name: "name", Namespace: "namespace"},
@@ -167,6 +178,143 @@ func TestUpdateScaleOnScaleTarget_KubernetesAPITimeoutDuringUpdate(t *testing.T)
 
 	assert.ErrorIs(t, err, context.DeadlineExceeded)
 	assert.Less(t, time.Since(startedAt), time.Second)
+}
+
+// useScaleUpdateBackoff replaces the package-level scale update retry backoff for the duration of
+// the test and returns a restore function. The whole value is replaced rather than mutating Steps
+// in place, so parallel and adjacent tests never observe a partially modified package-level
+// backoff. Only conflict errors are retried by the production loop; non-conflict errors fail fast
+// regardless of the step count.
+func useScaleUpdateBackoff(t *testing.T, steps int) func() {
+	t.Helper()
+	original := scaleUpdateRetryBackoff
+	scaleUpdateRetryBackoff = wait.Backoff{Steps: steps, Duration: time.Millisecond, Factor: 1.0}
+	return func() { scaleUpdateRetryBackoff = original }
+}
+
+// newConflictScaleExecutor builds the common fixtures for the optimistic-concurrency tests below.
+func newConflictScaleExecutor(t *testing.T) (*scaleExecutor, *mock_scale.MockScalesGetter, *mock_scale.MockScaleInterface, *v1alpha1.ScaledObject) {
+	t.Helper()
+	ctrl := gomock.NewController(t)
+	mockClient := mock_client.NewMockClient(ctrl)
+	recorder := events.NewFakeRecorder(8)
+	mockScaleClient := mock_scale.NewMockScalesGetter(ctrl)
+	mockScaleInterface := mock_scale.NewMockScaleInterface(ctrl)
+	// every Get and every Update in the retry loop obtains a fresh ScaleInterface
+	mockScaleClient.EXPECT().Scales("namespace").Return(mockScaleInterface).AnyTimes()
+
+	exec := NewScaleExecutor(mockClient, mockScaleClient, nil, kubernetesAPITimeout, recorder).(*scaleExecutor)
+	scaledObject := &v1alpha1.ScaledObject{
+		ObjectMeta: v1.ObjectMeta{Name: "name", Namespace: "namespace"},
+		Spec:       v1alpha1.ScaledObjectSpec{ScaleTargetRef: &v1alpha1.ScaleTarget{Name: "name"}},
+		Status: v1alpha1.ScaledObjectStatus{
+			ScaleTargetGVKR: &v1alpha1.GroupVersionKindResource{Group: "apps", Resource: "deployments", Kind: "Deployment"},
+		},
+	}
+	return exec, mockScaleClient, mockScaleInterface, scaledObject
+}
+
+func conflictError() error {
+	return apierrors.NewConflict(schema.GroupResource{Group: "apps", Resource: "deployments"}, "name",
+		fmt.Errorf("the object has been modified; please apply your changes to the latest version and try again"))
+}
+
+// TestUpdateScaleOnScaleTarget_RetriesOnConflict verifies that a stale write rejected with a
+// Conflict is retried against a fresh scale object instead of being surfaced as an error, and that
+// the eventually persisted value is the caller's desired replica count.
+func TestUpdateScaleOnScaleTarget_RetriesOnConflict(t *testing.T) {
+	exec, _, mockScaleInterface, scaledObject := newConflictScaleExecutor(t)
+	restoreBackoff := useScaleUpdateBackoff(t, 2)
+	defer restoreBackoff()
+
+	staleScale := &autoscalingv1.Scale{Spec: autoscalingv1.ScaleSpec{Replicas: 0}}
+	freshScale := &autoscalingv1.Scale{Spec: autoscalingv1.ScaleSpec{Replicas: 3}}
+
+	gomock.InOrder(
+		mockScaleInterface.EXPECT().Get(gomock.Any(), gomock.Any(), "name", gomock.Any()).Return(staleScale, nil),
+		mockScaleInterface.EXPECT().Update(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, conflictError()),
+		mockScaleInterface.EXPECT().Get(gomock.Any(), gomock.Any(), "name", gomock.Any()).Return(freshScale, nil),
+		mockScaleInterface.EXPECT().Update(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+			DoAndReturn(func(_ context.Context, _ interface{}, updated *autoscalingv1.Scale, _ interface{}) (*autoscalingv1.Scale, error) {
+				assert.Equal(t, int32(1), updated.Spec.Replicas, "the retried write must re-assert the desired replicas")
+				return updated, nil
+			}),
+	)
+
+	currentReplicas, err := exec.updateScaleOnScaleTarget(context.Background(), scaledObject, 1)
+
+	assert.NoError(t, err)
+	// the successful write is based on the fresh read (3 -> 1), so the reported "from" replicas
+	// come from the last successful read rather than the stale first read
+	assert.Equal(t, int32(3), currentReplicas)
+}
+
+// TestUpdateScaleOnScaleTarget_ConflictConvergesToDesiredValue covers the case where the
+// concurrent writer (e.g. the HPA controller) happened to set the same replicas KEDA wants. The
+// retried read observes the desired value and no second write is issued.
+func TestUpdateScaleOnScaleTarget_ConflictConvergesToDesiredValue(t *testing.T) {
+	exec, _, mockScaleInterface, scaledObject := newConflictScaleExecutor(t)
+	restoreBackoff := useScaleUpdateBackoff(t, 2)
+	defer restoreBackoff()
+
+	staleScale := &autoscalingv1.Scale{Spec: autoscalingv1.ScaleSpec{Replicas: 0}}
+	convergedScale := &autoscalingv1.Scale{Spec: autoscalingv1.ScaleSpec{Replicas: 1}}
+
+	gomock.InOrder(
+		mockScaleInterface.EXPECT().Get(gomock.Any(), gomock.Any(), "name", gomock.Any()).Return(staleScale, nil),
+		mockScaleInterface.EXPECT().Update(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, conflictError()),
+		mockScaleInterface.EXPECT().Get(gomock.Any(), gomock.Any(), "name", gomock.Any()).Return(convergedScale, nil),
+	)
+
+	currentReplicas, err := exec.updateScaleOnScaleTarget(context.Background(), scaledObject, 1)
+
+	assert.NoError(t, err)
+	assert.Equal(t, int32(1), currentReplicas, "the retried read already carries the desired replicas, so no second write is needed")
+}
+
+// TestUpdateScaleOnScaleTarget_ConflictRetriesExhausted verifies that once the backoff budget is
+// spent, the last conflict is returned to the caller rather than silently swallowed, and that no
+// more than the configured number of attempts are made.
+func TestUpdateScaleOnScaleTarget_ConflictRetriesExhausted(t *testing.T) {
+	exec, _, mockScaleInterface, scaledObject := newConflictScaleExecutor(t)
+	restoreBackoff := useScaleUpdateBackoff(t, 2)
+	defer restoreBackoff()
+
+	// two steps -> one Get/Update attempt plus one retried attempt, both updates conflict; each
+	// read must return a distinct object (DoAndReturn instead of a shared Return pointer),
+	// otherwise the retried read observes the in-place mutation of the previous attempt's object
+	mockScaleInterface.EXPECT().Get(gomock.Any(), gomock.Any(), "name", gomock.Any()).
+		DoAndReturn(func(_ context.Context, _ interface{}, _ string, _ interface{}) (*autoscalingv1.Scale, error) {
+			return &autoscalingv1.Scale{Spec: autoscalingv1.ScaleSpec{Replicas: 0}}, nil
+		}).Times(2)
+	mockScaleInterface.EXPECT().Update(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, conflictError()).Times(2)
+
+	currentReplicas, err := exec.updateScaleOnScaleTarget(context.Background(), scaledObject, 1)
+
+	assert.Error(t, err)
+	assert.True(t, apierrors.IsConflict(err))
+	assert.Equal(t, int32(0), currentReplicas, "the replicas read before the failed writes must still be reported")
+}
+
+// TestUpdateScaleOnScaleTarget_NonConflictErrorIsNotRetried proves that a non-conflict failure
+// (here an internal server error) fails fast on the first attempt and never triggers a re-read,
+// preserving the pre-retry single-attempt behavior for API and timeout errors.
+func TestUpdateScaleOnScaleTarget_NonConflictErrorIsNotRetried(t *testing.T) {
+	exec, _, mockScaleInterface, scaledObject := newConflictScaleExecutor(t)
+	restoreBackoff := useScaleUpdateBackoff(t, 2)
+	defer restoreBackoff()
+
+	scale := &autoscalingv1.Scale{Spec: autoscalingv1.ScaleSpec{Replicas: 0}}
+	internalErr := apierrors.NewInternalError(fmt.Errorf("apiserver is burning down"))
+
+	mockScaleInterface.EXPECT().Get(gomock.Any(), gomock.Any(), "name", gomock.Any()).Return(scale, nil)
+	mockScaleInterface.EXPECT().Update(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).Return(nil, internalErr)
+
+	_, err := exec.updateScaleOnScaleTarget(context.Background(), scaledObject, 1)
+
+	assert.Error(t, err)
+	assert.True(t, apierrors.IsInternalError(err))
+	assert.False(t, apierrors.IsConflict(err))
 }
 
 func TestScaleToMinReplicasFromLowerInitialReplicaCount(t *testing.T) {

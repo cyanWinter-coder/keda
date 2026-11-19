@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2668,4 +2669,234 @@ func TestGetScaledObjectMetrics_StoresRecordsForTheScaleLoop(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestGetScaledObjectState_MissingMetricsIsInactiveWithoutError pins the decision the scale loop
+// makes when a trigger source responds successfully but carries no metric values (e.g. an empty
+// queue). Such a response is "missing data", not an error: the trigger must be treated as inactive
+// without setting isScaledObjectError (which would invalidate the scalers cache and surface a
+// Ready=False condition), so no scale action or fallback is triggered by an empty result.
+func TestGetScaledObjectState_MissingMetricsIsInactiveWithoutError(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	recorder := events.NewFakeRecorder(4)
+	mockClient := mock_client.NewMockClient(ctrl)
+	mockExecutor := mock_executor.NewMockScaleExecutor(ctrl)
+
+	metricName := "missing-metric"
+	scaler := mock_scalers.NewMockScaler(ctrl)
+	scaler.EXPECT().GetMetricSpecForScaling(gomock.Any()).Return([]v2.MetricSpec{createMetricSpec(10, metricName)})
+	// healthy response, but no metric values and not active
+	scaler.EXPECT().GetMetricsAndActivity(gomock.Any(), metricName).Return([]external_metrics.ExternalMetricValue{}, false, nil)
+	scaler.EXPECT().Close(gomock.Any())
+
+	scaledObject := &kedav1alpha1.ScaledObject{
+		ObjectMeta: metav1.ObjectMeta{Name: "missing-metrics-so", Namespace: testNamespaceGlobal},
+		Spec: kedav1alpha1.ScaledObjectSpec{
+			ScaleTargetRef: &kedav1alpha1.ScaleTarget{Name: "target"},
+			Triggers:       []kedav1alpha1.ScaleTriggers{{Type: "some-trigger"}},
+		},
+		Status: kedav1alpha1.ScaledObjectStatus{
+			ExternalMetricNames: []string{metricName},
+		},
+	}
+
+	scalerCache := &cache.ScalersCache{
+		ScaledObject: scaledObject,
+		Scalers: []cache.ScalerBuilder{{
+			Scaler: scaler,
+			Factory: func(context.Context) (scalers.Scaler, *scalersconfig.ScalerConfig, error) {
+				return scaler, &scalersconfig.ScalerConfig{}, nil
+			},
+		}},
+		Recorder: recorder,
+	}
+
+	sh := &scaleHandler{
+		client:                   mockClient,
+		scaleLoopContexts:        &sync.Map{},
+		scaleExecutor:            mockExecutor,
+		globalHTTPTimeout:        time.Second,
+		recorder:                 recorder,
+		scalerCaches:             map[string]*cache.ScalersCache{scaledObject.GenerateIdentifier(): scalerCache},
+		scalerCachesLock:         &sync.RWMutex{},
+		scaledObjectsMetricCache: metricscache.NewMetricsCache(),
+		rawMetricsSubscriptions:  map[string]*RawMetricSubscriptions{},
+		metricToSubscriptions:    map[metricMeta][]*RawMetricSubscriptions{},
+		subsLock:                 &sync.RWMutex{},
+	}
+
+	isActive, isError, metricsRecords, activeTriggers, isFallbackActive, err := sh.getScaledObjectState(context.Background(), scaledObject)
+
+	assert.NoError(t, err)
+	assert.False(t, isActive, "an empty metric response must not activate the ScaledObject")
+	assert.False(t, isError, "missing metrics are not a scaler error, the cache must not be invalidated")
+	assert.False(t, isFallbackActive)
+	assert.Empty(t, activeTriggers)
+	assert.Empty(t, metricsRecords, "no record is produced for a trigger that returned no metrics")
+
+	// the scalers cache must still be present: an empty-result response is benign and must not
+	// trigger the ClearScalersCache path that scaler errors do
+	_, cacheErr := sh.GetScalersCache(context.Background(), scaledObject)
+	assert.NoError(t, cacheErr)
+	scalerCache.Close(context.Background())
+}
+
+// TestGetScaledObjectMetrics_EmptyMetricsReportsNoMatchingMetrics covers the HPA-facing counterpart
+// of the missing-metrics decision: when every trigger returns an empty (but error-free) metric
+// list, the metrics adapter returns an explicit "no matching metrics" error instead of an empty
+// ExternalMetricValueList, so the HPA controller records a FailedGetExternalMetric event rather
+// than scaling on a zero-valued fabricated metric.
+func TestGetScaledObjectMetrics_EmptyMetricsReportsNoMatchingMetrics(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	recorder := events.NewFakeRecorder(4)
+	mockClient := mock_client.NewMockClient(ctrl)
+
+	metricName := "missing-metric"
+	scaler := mock_scalers.NewMockScaler(ctrl)
+	scaler.EXPECT().GetMetricSpecForScaling(gomock.Any()).Return([]v2.MetricSpec{createMetricSpec(10, metricName)}).AnyTimes()
+	scaler.EXPECT().GetMetricsAndActivity(gomock.Any(), metricName).Return([]external_metrics.ExternalMetricValue{}, false, nil)
+
+	scaledObject := &kedav1alpha1.ScaledObject{
+		ObjectMeta: metav1.ObjectMeta{Name: "missing-metrics-so", Namespace: testNamespaceGlobal},
+		Spec: kedav1alpha1.ScaledObjectSpec{
+			ScaleTargetRef: &kedav1alpha1.ScaleTarget{Name: "target"},
+		},
+		Status: kedav1alpha1.ScaledObjectStatus{
+			ExternalMetricNames: []string{metricName},
+		},
+	}
+
+	scalerCache := &cache.ScalersCache{
+		ScaledObject: scaledObject,
+		Scalers: []cache.ScalerBuilder{{
+			Scaler: scaler,
+			Factory: func(context.Context) (scalers.Scaler, *scalersconfig.ScalerConfig, error) {
+				return scaler, &scalersconfig.ScalerConfig{}, nil
+			},
+		}},
+		Recorder: recorder,
+	}
+
+	sh := &scaleHandler{
+		client:                   mockClient,
+		scaleLoopContexts:        &sync.Map{},
+		globalHTTPTimeout:        time.Second,
+		recorder:                 recorder,
+		scalerCaches:             map[string]*cache.ScalersCache{scaledObject.GenerateIdentifier(): scalerCache},
+		scalerCachesLock:         &sync.RWMutex{},
+		scaledObjectsMetricCache: metricscache.NewMetricsCache(),
+		rawMetricsSubscriptions:  map[string]*RawMetricSubscriptions{},
+		metricToSubscriptions:    map[metricMeta][]*RawMetricSubscriptions{},
+		subsLock:                 &sync.RWMutex{},
+	}
+
+	metrics, err := sh.GetScaledObjectMetrics(context.Background(), scaledObject.Name, scaledObject.Namespace, metricName)
+
+	assert.Nil(t, metrics)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "no matching metrics found")
+
+	scaler.EXPECT().Close(gomock.Any())
+	scalerCache.Close(context.Background())
+}
+
+// TestCheckScalers_SerializesConcurrentInvocations proves the scale loop's per-object mutex makes
+// RequestScale calls mutually exclusive even when checkScalers is entered concurrently (the
+// situation produced by an overlapping push-scaler activation and a polling tick). Without the
+// lock, two scale decisions could race and the later one could overwrite the earlier desired
+// replica count; here both goroutines must complete but RequestScale is never entered twice at the
+// same time.
+func TestCheckScalers_SerializesConcurrentInvocations(t *testing.T) {
+	ctrl := gomock.NewController(t)
+	recorder := events.NewFakeRecorder(16)
+	mockClient := mock_client.NewMockClient(ctrl)
+	mockExecutor := mock_executor.NewMockScaleExecutor(ctrl)
+
+	metricName := "serial-metric"
+	metricValue := scalers.GenerateMetricInMili(metricName, float64(10))
+	scaler := mock_scalers.NewMockScaler(ctrl)
+	scaler.EXPECT().GetMetricSpecForScaling(gomock.Any()).Return([]v2.MetricSpec{createMetricSpec(10, metricName)}).AnyTimes()
+	scaler.EXPECT().GetMetricsAndActivity(gomock.Any(), metricName).
+		Return([]external_metrics.ExternalMetricValue{metricValue}, true, nil).AnyTimes()
+
+	scaledObject := &kedav1alpha1.ScaledObject{
+		ObjectMeta: metav1.ObjectMeta{Name: "serial-so", Namespace: testNamespaceGlobal},
+		Spec: kedav1alpha1.ScaledObjectSpec{
+			ScaleTargetRef: &kedav1alpha1.ScaleTarget{Name: "target"},
+		},
+		Status: kedav1alpha1.ScaledObjectStatus{
+			ExternalMetricNames: []string{metricName},
+		},
+	}
+
+	scalerCache := &cache.ScalersCache{
+		ScaledObject: scaledObject,
+		Scalers: []cache.ScalerBuilder{{
+			Scaler: scaler,
+			Factory: func(context.Context) (scalers.Scaler, *scalersconfig.ScalerConfig, error) {
+				return scaler, &scalersconfig.ScalerConfig{}, nil
+			},
+		}},
+		Recorder: recorder,
+	}
+
+	sh := &scaleHandler{
+		client:                   mockClient,
+		scaleLoopContexts:        &sync.Map{},
+		scaleExecutor:            mockExecutor,
+		globalHTTPTimeout:        time.Second,
+		recorder:                 recorder,
+		scalerCaches:             map[string]*cache.ScalersCache{scaledObject.GenerateIdentifier(): scalerCache},
+		scalerCachesLock:         &sync.RWMutex{},
+		scaledObjectsMetricCache: metricscache.NewMetricsCache(),
+		rawMetricsSubscriptions:  map[string]*RawMetricSubscriptions{},
+		metricToSubscriptions:    map[metricMeta][]*RawMetricSubscriptions{},
+		subsLock:                 &sync.RWMutex{},
+	}
+
+	const invocations = 8
+	statusWriter := mock_client.NewMockStatusWriter(ctrl)
+	// checkScalers re-reads the ScaledObject, then handleResult fetches it again before the status
+	// patch; both reads and the optional patch happen once per invocation, so allow them generously
+	mockClient.EXPECT().Get(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+	mockClient.EXPECT().Status().Return(statusWriter).AnyTimes()
+	statusWriter.EXPECT().Patch(gomock.Any(), gomock.Any(), gomock.Any()).Return(nil).AnyTimes()
+
+	var inFlight int32
+	var maxInFlight int32
+	requestStarted := make(chan struct{}, invocations)
+	mockExecutor.EXPECT().RequestScale(gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any(), gomock.Any()).
+		DoAndReturn(func(_ context.Context, _ *kedav1alpha1.ScaledObject, _ bool, _ bool, _ executor.ScaleExecutorOptions) executor.ScaleResult {
+			cur := atomic.AddInt32(&inFlight, 1)
+			for {
+				prev := atomic.LoadInt32(&maxInFlight)
+				if cur <= prev || atomic.CompareAndSwapInt32(&maxInFlight, prev, cur) {
+					break
+				}
+			}
+			requestStarted <- struct{}{}
+			// hold the lock briefly so an overlapping checkScalers has to wait, making a missing
+			// lock observable as maxInFlight > 1
+			time.Sleep(10 * time.Millisecond)
+			atomic.AddInt32(&inFlight, -1)
+			return executor.ScaleResult{Conditions: *kedav1alpha1.GetInitializedConditions()}
+		}).Times(invocations)
+
+	scalingMutex := &sync.Mutex{}
+	var wg sync.WaitGroup
+	for range invocations {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			sh.checkScalers(context.Background(), scaledObject.DeepCopy(), scalingMutex)
+		}()
+	}
+	wg.Wait()
+
+	assert.Equal(t, int32(1), atomic.LoadInt32(&maxInFlight),
+		"RequestScale must never run concurrently for the same ScaledObject; the per-object scaling mutex serializes scale decisions")
+	assert.Len(t, requestStarted, invocations, "every concurrent checkScalers invocation must reach RequestScale exactly once")
+
+	scaler.EXPECT().Close(gomock.Any())
+	scalerCache.Close(context.Background())
 }

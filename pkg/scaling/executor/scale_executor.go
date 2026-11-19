@@ -26,6 +26,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/scale"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/util/retry"
 	runtimeclient "sigs.k8s.io/controller-runtime/pkg/client"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -37,6 +38,11 @@ const (
 	defaultInitialCooldownPeriod = 0      // 0 seconds
 	defaultCooldownPeriod        = 5 * 60 // 5 minutes
 )
+
+// scaleUpdateRetryBackoff drives the conflict-retry loop guarding read-modify-write updates of the
+// scale subresource. It is a variable so tests can shrink it to a single attempt; production uses
+// the same backoff as retry.DefaultRetry (5 steps, 10ms interval).
+var scaleUpdateRetryBackoff = retry.DefaultRetry
 
 // ScaleResult contains the result of ScaleExecutor actions
 type ScaleResult struct {

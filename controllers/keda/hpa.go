@@ -19,6 +19,7 @@ package keda
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strconv"
@@ -28,8 +29,11 @@ import (
 	"github.com/go-logr/logr"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	kedav1alpha1 "github.com/kedacore/keda/v2/apis/keda/v1alpha1"
@@ -191,6 +195,30 @@ func (r *ScaledObjectReconciler) newHPAForScaledObject(ctx context.Context, logg
 	return hpa, nil
 }
 
+// updateHPAWithConflictRetry persists the desired HPA, re-reading and re-applying the intended
+// fields on an optimistic-concurrency conflict instead of failing the whole reconcile.
+//
+// The reconciler workqueue already serializes reconcile attempts for a single ScaledObject, but
+// the HPA can still be modified between the read in ensureHPAForScaledObjectExists and the write
+// here (for example by a user or another controller touching labels/annotations). On a Conflict we
+// fetch the latest object, let apply mutate that fresh copy, and retry; non-conflict errors are
+// returned immediately. The desired state always wins because apply only sets ScaledObject-owned
+// fields, so retrying against the newer resourceVersion never resurrects a stale value.
+func (r *ScaledObjectReconciler) updateHPAWithConflictRetry(ctx context.Context, logger logr.Logger, namespacedName types.NamespacedName, apply func(*autoscalingv2.HorizontalPodAutoscaler)) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		current := &autoscalingv2.HorizontalPodAutoscaler{}
+		if err := r.Client.Get(ctx, namespacedName, current); err != nil {
+			return err
+		}
+		apply(current)
+		err := r.Client.Update(ctx, current)
+		if err != nil && apierrors.IsConflict(err) {
+			logger.V(1).Info("HPA update conflicted, re-reading and retrying", "HPA.Namespace", namespacedName.Namespace, "HPA.Name", namespacedName.Name)
+		}
+		return err
+	})
+}
+
 // updateHPAIfNeeded checks whether update of HPA is needed
 func (r *ScaledObjectReconciler) updateHPAIfNeeded(ctx context.Context, logger logr.Logger, scaledObject *kedav1alpha1.ScaledObject, foundHpa *autoscalingv2.HorizontalPodAutoscaler, gvkr *kedav1alpha1.GroupVersionKindResource) error {
 	hpa, err := r.newHPAForScaledObject(ctx, logger, scaledObject, gvkr)
@@ -199,6 +227,12 @@ func (r *ScaledObjectReconciler) updateHPAIfNeeded(ctx context.Context, logger l
 		return err
 	}
 
+	hpaNamespacedName := types.NamespacedName{Name: foundHpa.Name, Namespace: foundHpa.Namespace}
+	// the controller reference set by newHPAForScaledObject is part of the desired state: without it
+	// the conflict-retry apply (which starts from a freshly read HPA) would never complete an HPA
+	// ownership transfer, because each apply only sets the fields explicitly assigned below.
+	desiredOwnerReferences := hpa.OwnerReferences
+
 	// DeepDerivative ignores extra entries in arrays which makes removing the last trigger not update things, so trigger and update any time the metrics count is different.
 	// DeepDerivative also treats nil as "unset" and a subset of any value, so we need to explicitly check Behavior with DeepEqual
 	// to detect when paused-scale-in/out annotations are removed and Behavior should change from Disabled back to nil.
@@ -206,7 +240,11 @@ func (r *ScaledObjectReconciler) updateHPAIfNeeded(ctx context.Context, logger l
 		!equality.Semantic.DeepEqual(hpa.Spec.Behavior, foundHpa.Spec.Behavior) ||
 		!equality.Semantic.DeepDerivative(hpa.Spec, foundHpa.Spec) {
 		logger.V(1).Info("Found difference in the HPA spec accordint to ScaledObject", "currentHPA", foundHpa.Spec, "newHPA", hpa.Spec)
-		if err = r.Client.Update(ctx, hpa); err != nil {
+		desiredSpec := hpa.Spec.DeepCopy()
+		if err = r.updateHPAWithConflictRetry(ctx, logger, hpaNamespacedName, func(current *autoscalingv2.HorizontalPodAutoscaler) {
+			current.Spec = *desiredSpec
+			current.OwnerReferences = desiredOwnerReferences
+		}); err != nil {
 			foundHpa.Spec = hpa.Spec
 			logger.Error(err, "Failed to update HPA", "HPA.Namespace", foundHpa.Namespace, "HPA.Name", foundHpa.Name)
 			return err
@@ -217,7 +255,11 @@ func (r *ScaledObjectReconciler) updateHPAIfNeeded(ctx context.Context, logger l
 
 	if !equality.Semantic.DeepDerivative(hpa.Labels, foundHpa.Labels) {
 		logger.V(1).Info("Found difference in the HPA labels accordint to ScaledObject", "currentHPA", foundHpa.Labels, "newHPA", hpa.Labels)
-		if err = r.Client.Update(ctx, hpa); err != nil {
+		desiredLabels := maps.Clone(hpa.Labels)
+		if err = r.updateHPAWithConflictRetry(ctx, logger, hpaNamespacedName, func(current *autoscalingv2.HorizontalPodAutoscaler) {
+			current.Labels = desiredLabels
+			current.OwnerReferences = desiredOwnerReferences
+		}); err != nil {
 			foundHpa.Labels = hpa.Labels
 			logger.Error(err, "Failed to update HPA", "HPA.Namespace", foundHpa.Namespace, "HPA.Name", foundHpa.Name)
 			return err
@@ -228,7 +270,11 @@ func (r *ScaledObjectReconciler) updateHPAIfNeeded(ctx context.Context, logger l
 	if (hpa.Annotations == nil && foundHpa.Annotations != nil) ||
 		!equality.Semantic.DeepDerivative(hpa.Annotations, foundHpa.Annotations) {
 		logger.V(1).Info("Found difference in the HPA annotations according to ScaledObject", "currentHPA", foundHpa.Annotations, "newHPA", hpa.Annotations)
-		if err = r.Client.Update(ctx, hpa); err != nil {
+		desiredAnnotations := maps.Clone(hpa.Annotations)
+		if err = r.updateHPAWithConflictRetry(ctx, logger, hpaNamespacedName, func(current *autoscalingv2.HorizontalPodAutoscaler) {
+			current.Annotations = desiredAnnotations
+			current.OwnerReferences = desiredOwnerReferences
+		}); err != nil {
 			foundHpa.Annotations = hpa.Annotations
 			logger.Error(err, "Failed to update HPA", "HPA.Namespace", foundHpa.Namespace, "HPA.Name", foundHpa.Name)
 			return err

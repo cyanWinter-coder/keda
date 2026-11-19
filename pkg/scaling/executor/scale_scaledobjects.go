@@ -26,6 +26,7 @@ import (
 	autoscalingv1 "k8s.io/api/autoscaling/v1"
 	autoscalingv2 "k8s.io/api/autoscaling/v2"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -307,24 +308,67 @@ func (e *scaleExecutor) getScaleTargetScale(ctx context.Context, scaledObject *k
 	return e.scaleClient.Scales(scaledObject.Namespace).Get(ctx, scaledObject.Status.ScaleTargetGVKR.GroupResource(), scaledObject.Spec.ScaleTargetRef.Name, metav1.GetOptions{})
 }
 
+// updateScaleOnScaleTarget sets the ScaleTarget's replica count to the requested value and
+// returns the replica count observed on the scale object before the update.
+//
+// The read-modify-write is guarded by an explicit conflict-retry loop: if the HPA controller, a
+// user or another actor updates the scale object between the Get and the Update, the API server
+// rejects the stale write with a Conflict and we re-fetch instead of overwriting the concurrent
+// writer's desired replica count. On retry we re-evaluate the current replicas and only re-assert
+// our own decision (the caller's desired value), so a conflict never results in clobbering a
+// newer desired state. Every other error (timeouts, API failures, ...) is returned immediately and
+// is never retried, preserving the pre-existing single-attempt semantics for those paths.
 func (e *scaleExecutor) updateScaleOnScaleTarget(ctx context.Context, scaledObject *kedav1alpha1.ScaledObject, replicas int32) (int32, error) {
 	pollingInterval, err := getPollingInterval(scaledObject)
 	if err != nil {
 		return -1, err
 	}
-	operationCtx, cancel := context.WithTimeout(ctx, pollingInterval+e.kubernetesAPITimeout)
-	defer cancel()
-	scale, err := e.getScaleTargetScale(operationCtx, scaledObject)
-	if err != nil {
-		return -1, err
+
+	var currentReplicas int32
+	readSucceeded := false
+	backoff := scaleUpdateRetryBackoff
+	for {
+		operationCtx, cancel := context.WithTimeout(ctx, pollingInterval+e.kubernetesAPITimeout)
+		scale, getErr := e.getScaleTargetScale(operationCtx, scaledObject)
+		if getErr != nil {
+			cancel()
+			if !readSucceeded {
+				return -1, getErr
+			}
+			return currentReplicas, getErr
+		}
+
+		// remember the replicas the scale target had before the first attempted write; this is the
+		// "original replica count" the callers report in their success/failure events
+		currentReplicas = scale.Spec.Replicas
+		readSucceeded = true
+
+		// the scale target already carries the desired replicas (a previous retry succeeded, or a
+		// concurrent writer happened to set the same value): nothing to write
+		if scale.Spec.Replicas == replicas {
+			cancel()
+			return currentReplicas, nil
+		}
+
+		scale.Spec.Replicas = replicas
+		_, updateErr := e.scaleClient.Scales(scaledObject.Namespace).Update(operationCtx, scaledObject.Status.ScaleTargetGVKR.GroupResource(), scale, metav1.UpdateOptions{})
+		cancel()
+		if updateErr == nil {
+			return currentReplicas, nil
+		}
+
+		// only optimistic-concurrency conflicts are retried; anything else fails fast
+		if !apierrors.IsConflict(updateErr) || backoff.Steps <= 1 {
+			return currentReplicas, updateErr
+		}
+		backoff.Steps--
+
+		select {
+		case <-ctx.Done():
+			return currentReplicas, ctx.Err()
+		case <-time.After(backoff.Step()):
+		}
 	}
-
-	// Update with requested replicas.
-	currentReplicas := scale.Spec.Replicas
-	scale.Spec.Replicas = replicas
-
-	_, err = e.scaleClient.Scales(scaledObject.Namespace).Update(operationCtx, scaledObject.Status.ScaleTargetGVKR.GroupResource(), scale, metav1.UpdateOptions{})
-	return currentReplicas, err
 }
 
 // handlePaused skips normal scaling logic while the ScaledObject is paused.
